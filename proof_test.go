@@ -2,12 +2,15 @@ package iavl
 
 import (
 	"bytes"
+	"encoding/hex"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/tendermint/go-amino"
+	"github.com/tendermint/tendermint/crypto/tmhash"
+	cmn "github.com/tendermint/tendermint/libs/common"
 	"github.com/tendermint/tendermint/libs/db"
 	"github.com/tendermint/tendermint/libs/test"
 )
@@ -233,6 +236,79 @@ func verifyProof(t *testing.T, proof *RangeProof, root []byte) {
 				proofBytes, badProofBytes)
 		}
 	}
+}
+
+func TestVulnerabilityInRangeProof(t *testing.T) {
+	random := cmn.NewRand()
+	random.Seed(0) // for determinism
+
+	tree := NewMutableTree(db.NewMemDB(), 0)
+
+	// two keys only
+	keys := []byte{0x11, 0x32}
+	values := make([][]byte, len(keys))
+
+	// make random values and insert into tree
+	for i, ikey := range keys {
+		key := []byte{ikey}
+		values[i] = []byte(random.Str(8))
+		tree.Set(key, values[i])
+	}
+	// get root
+	root := tree.WorkingHash()
+
+	// use the rightmost kv pair in the tree so the inner nodes will populate left
+	k := []byte{keys[1]}
+
+	val, proof, err := tree.GetWithProof(k)
+	require.NoError(t, err)
+
+	err = proof.Verify(root)
+	require.NoError(t, err)
+
+	err = proof.VerifyItem(k, val)
+	if err != nil {
+		panic(err)
+	}
+
+	forgedPayloadBytes := mustDecode("0xabcd")
+	forgedValueHash := tmhash.Sum(forgedPayloadBytes)
+
+	// make a forgery of the proof by adding:
+	// - a new leaf node to the right
+	// - an empty inner node
+	// - a right entry in the path
+	_, proof2, _ := tree.GetWithProof(k)
+	forgedNode := proof2.Leaves[0]
+	forgedNode.Key = []byte{0xFF}
+	forgedNode.ValueHash = forgedValueHash
+	proof2.Leaves = append(proof2.Leaves, forgedNode)
+	proof2.InnerNodes = append(proof2.InnerNodes, PathToLeaf{})
+	proof2.LeftPath[0].Right = mustDecode("82C36CED85E914DAE8FDF6DD11FD5833121AA425711EB126C470CE28FF6623D5")
+
+	rootHash := proof.ComputeRootHash()
+	verifyErr := proof.Verify(rootHash)
+	require.NoError(t, verifyErr)
+
+	// forgery gives same root hash (!)
+	rootHash2 := proof2.ComputeRootHash()
+	require.NoError(t, verifyErr)
+	require.Equal(t, rootHash, rootHash2)
+
+	op := NewIAVLValueOp(nil, proof2)
+	err = SingleValueOpVerifier(op)
+	require.Error(t, err, "range proof suspended")
+}
+
+func mustDecode(str string) []byte {
+	if strings.HasPrefix(str, "0x") {
+		str = str[2:]
+	}
+	b, err := hex.DecodeString(str)
+	if err != nil {
+		panic(err)
+	}
+	return b
 }
 
 //----------------------------------------
